@@ -1,0 +1,250 @@
+name: Docs/Build and Publish
+
+# Deploy matrix:
+#   push develop      -> mike deploy develop
+#   push release/latest -> mike deploy latest
+#   release published -> mike deploy <tag> only; does not move /latest/
+
+on:
+  push:
+    branches:
+      - develop
+      - release/latest
+  workflow_dispatch:
+  release:
+    types: [published]
+
+# Ensure only one concurrent deployment
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.ref}}
+  cancel-in-progress: true
+
+# Restrict permissions by default
+permissions:
+  contents: write # Required for committing to gh-pages
+  pages: write # Required for deploying to Pages
+  pull-requests: write # Required for PR comments
+
+
+jobs:
+  docs-build-deploy:
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SITE_HOST: supervision.roboflow.com
+      SITE_URL: https://supervision.roboflow.com
+      INDEXNOW_KEY: 0d5d9799b1cc4a39825146388c6781eb
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare Python environment
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          python-version: "3.10"
+          activate-environment: true
+
+      - name: Install documentation dependencies from the lockfile
+        run: uv sync --frozen --group docs
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "${{ github.actor }}"
+          git config user.email "${{ github.actor }}@users.noreply.github.com"
+
+      - name: Determine documentation version
+        id: version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+
+          deploy_tag=""
+          is_candidate="false"
+          deploy_docs="true"
+
+          if [ "${GITHUB_EVENT_NAME}" = "release" ]; then
+            deploy_docs="false"
+            if [ "${GITHUB_EVENT_ACTION}" = "published" ]; then
+              deploy_tag="${RELEASE_TAG#v}"
+              deploy_tag="${deploy_tag%.post*}"
+              deploy_docs="true"
+
+              if [[ "${deploy_tag}" =~ (^|[._-]|[0-9])[Rr][Cc][0-9]+$ ]]; then
+                is_candidate="true"
+                deploy_docs="false"
+              fi
+            fi
+          fi
+
+          {
+            echo "DEPLOY_TAG=${deploy_tag}"
+            echo "IS_CANDIDATE=${is_candidate}"
+            echo "DEPLOY_DOCS=${deploy_docs}"
+          } >> "${GITHUB_ENV}"
+
+          {
+            echo "deploy_tag=${deploy_tag}"
+            echo "is_candidate=${is_candidate}"
+            echo "deploy_docs=${deploy_docs}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Build and deploy versioned documentation
+        if: steps.version.outputs.deploy_docs == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] || { [ "${GITHUB_EVENT_NAME}" = "push" ] && [ "${GITHUB_REF}" = "refs/heads/develop" ]; }; then
+            mike deploy --push develop
+          elif [ "${GITHUB_EVENT_NAME}" = "push" ] && [ "${GITHUB_REF}" = "refs/heads/release/latest" ]; then
+            if mike list | grep -qE '^latest([[:space:]]|$)'; then
+              mike delete --push latest
+            fi
+            mike deploy --push latest
+          elif [ "${GITHUB_EVENT_NAME}" = "release" ]; then
+            if [ -z "${DEPLOY_TAG}" ]; then
+              echo "Release tag normalized to an empty documentation version." >&2
+              exit 1
+            fi
+            mike deploy --push "${DEPLOY_TAG}"
+          else
+            echo "No documentation deployment is configured for ${GITHUB_EVENT_NAME}." >&2
+            exit 1
+          fi
+
+      - name: Update documentation branch root resources
+        if: steps.version.outputs.deploy_docs == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git fetch origin gh-pages:refs/remotes/origin/gh-pages
+          worktree="${RUNNER_TEMP:-/tmp}/supervision-gh-pages"
+          rm -rf "${worktree}"
+          git worktree prune
+          git worktree add --detach "${worktree}" origin/gh-pages
+          cleanup() {
+            git worktree remove --force "${worktree}" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          cp docs/robots.txt "${worktree}/robots.txt"
+          cp docs/llms.txt "${worktree}/llms.txt"
+          cp docs/llms.full.txt "${worktree}/llms.full.txt"
+          cp docs/llms-100k.txt "${worktree}/llms-100k.txt"
+          cp docs/_headers "${worktree}/_headers"
+          cp "docs/${INDEXNOW_KEY}.txt" "${worktree}/${INDEXNOW_KEY}.txt"
+
+          if [ "${GITHUB_REF}" = "refs/heads/release/latest" ] && [ -f "${worktree}/latest/sitemap.xml" ]; then
+            cp "${worktree}/latest/sitemap.xml" "${worktree}/sitemap.xml"
+            gzip -9 -n -c "${worktree}/sitemap.xml" > "${worktree}/sitemap.xml.gz"
+          fi
+
+          git -C "${worktree}" add -- \
+            robots.txt \
+            llms.txt \
+            llms.full.txt \
+            llms-100k.txt \
+            _headers \
+            "${INDEXNOW_KEY}.txt"
+
+          if [ -f "${worktree}/sitemap.xml" ]; then
+            git -C "${worktree}" add -- sitemap.xml
+          fi
+          if [ -f "${worktree}/sitemap.xml.gz" ]; then
+            git -C "${worktree}" add -- sitemap.xml.gz
+          fi
+
+          if git -C "${worktree}" diff --cached --quiet; then
+            echo "Documentation branch root resources are already up to date."
+          else
+            git -C "${worktree}" commit -m "docs: update site root resources"
+            git -C "${worktree}" push origin HEAD:gh-pages
+          fi
+
+      - name: Notify IndexNow
+        if: github.event_name != 'release' && steps.version.outputs.deploy_docs == 'true'
+        shell: bash
+        env:
+          INDEXNOW_URLS: |
+            [
+              "https://supervision.roboflow.com/latest/",
+              "https://supervision.roboflow.com/latest/about/",
+              "https://supervision.roboflow.com/latest/contact/",
+              "https://supervision.roboflow.com/latest/faq/",
+              "https://supervision.roboflow.com/latest/how_to/detect_and_annotate/",
+              "https://supervision.roboflow.com/latest/how_to/save_detections/",
+              "https://supervision.roboflow.com/latest/how_to/filter_detections/",
+              "https://supervision.roboflow.com/latest/how_to/detect_small_objects/",
+              "https://supervision.roboflow.com/latest/how_to/track_objects/",
+              "https://supervision.roboflow.com/latest/how_to/process_datasets/",
+              "https://supervision.roboflow.com/latest/how_to/benchmark_a_model/",
+              "https://supervision.roboflow.com/latest/how_to/count_in_zone/",
+              "https://supervision.roboflow.com/latest/how_to/use_compact_masks/",
+              "https://supervision.roboflow.com/latest/detection/core/",
+              "https://supervision.roboflow.com/latest/detection/annotators/",
+              "https://supervision.roboflow.com/latest/detection/compact_mask/",
+              "https://supervision.roboflow.com/latest/detection/utils/converters/",
+              "https://supervision.roboflow.com/latest/detection/utils/iou_and_nms/",
+              "https://supervision.roboflow.com/latest/detection/utils/boxes/",
+              "https://supervision.roboflow.com/latest/detection/utils/masks/",
+              "https://supervision.roboflow.com/latest/detection/utils/polygons/",
+              "https://supervision.roboflow.com/latest/detection/utils/vlms/",
+              "https://supervision.roboflow.com/latest/keypoint/core/",
+              "https://supervision.roboflow.com/latest/keypoint/annotators/",
+              "https://supervision.roboflow.com/latest/classification/core/",
+              "https://supervision.roboflow.com/latest/detection/tools/line_zone/",
+              "https://supervision.roboflow.com/latest/detection/tools/polygon_zone/",
+              "https://supervision.roboflow.com/latest/detection/tools/inference_slicer/",
+              "https://supervision.roboflow.com/latest/detection/tools/smoother/",
+              "https://supervision.roboflow.com/latest/detection/tools/save_detections/",
+              "https://supervision.roboflow.com/latest/trackers/",
+              "https://supervision.roboflow.com/latest/datasets/core/",
+              "https://supervision.roboflow.com/latest/metrics/mean_average_precision/",
+              "https://supervision.roboflow.com/latest/metrics/mean_average_recall/",
+              "https://supervision.roboflow.com/latest/metrics/precision/",
+              "https://supervision.roboflow.com/latest/metrics/recall/",
+              "https://supervision.roboflow.com/latest/metrics/f1_score/",
+              "https://supervision.roboflow.com/latest/metrics/common_values/",
+              "https://supervision.roboflow.com/latest/detection/metrics/",
+              "https://supervision.roboflow.com/latest/utils/conversion/",
+              "https://supervision.roboflow.com/latest/utils/video/",
+              "https://supervision.roboflow.com/latest/utils/image/",
+              "https://supervision.roboflow.com/latest/utils/image_window/",
+              "https://supervision.roboflow.com/latest/utils/iterables/",
+              "https://supervision.roboflow.com/latest/utils/notebook/",
+              "https://supervision.roboflow.com/latest/utils/file/",
+              "https://supervision.roboflow.com/latest/utils/draw/",
+              "https://supervision.roboflow.com/latest/utils/geometry/",
+              "https://supervision.roboflow.com/latest/assets/",
+              "https://supervision.roboflow.com/latest/cookbooks/",
+              "https://supervision.roboflow.com/latest/contributing/",
+              "https://supervision.roboflow.com/latest/code_of_conduct/",
+              "https://supervision.roboflow.com/latest/license/",
+              "https://supervision.roboflow.com/latest/changelog/",
+              "https://supervision.roboflow.com/latest/deprecated/"
+            ]
+        run: |
+          set -euo pipefail
+
+          payload="$(jq -n \
+            --arg host "${SITE_HOST}" \
+            --arg key "${INDEXNOW_KEY}" \
+            --arg keyLocation "${SITE_URL}/${INDEXNOW_KEY}.txt" \
+            --argjson urlList "${INDEXNOW_URLS}" \
+            '{host: $host, key: $key, keyLocation: $keyLocation, urlList: $urlList}')"
+
+          status="$(curl --silent --show-error --location \
+            --connect-timeout 10 --max-time 30 \
+            --output /dev/null \
+            --write-out '%{http_code}' \
+            --request POST 'https://api.indexnow.org/IndexNow' \
+            --header 'Content-Type: application/json; charset=utf-8' \
+            --data-binary "${payload}" 2>/dev/null || true)"
+
+          echo "IndexNow HTTP status: ${status:-000}"
